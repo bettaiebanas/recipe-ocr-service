@@ -1,7 +1,6 @@
 import os
 from io import BytesIO
 from typing import List, Optional
-
 import httpx
 import pytesseract
 from PIL import Image
@@ -9,7 +8,10 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
 app = FastAPI()
-
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+    
 INTERNAL_SECRET = os.getenv("PYTHON_RECIPE_API_SECRET", "")
 
 
