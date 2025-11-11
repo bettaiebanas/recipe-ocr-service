@@ -14,6 +14,16 @@ async def root():
     
 INTERNAL_SECRET = os.getenv("PYTHON_RECIPE_API_SECRET", "")
 
+@app.post("/import-recipe-from-image")
+async def import_recipe_from_image(payload: ImagePayload, request: Request):
+    # TEMPORAIREMENT désactivé pour faciliter les tests
+    # if INTERNAL_SECRET:
+    #     header_secret = request.headers.get("x-internal-secret")
+    #     if header_secret != INTERNAL_SECRET:
+    #         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+
 
 class ImagePayload(BaseModel):
     image_url: str
