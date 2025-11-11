@@ -1,4 +1,5 @@
 import os
+import base64
 from io import BytesIO
 from typing import Optional
 
@@ -7,23 +8,24 @@ import pytesseract
 from PIL import Image
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 
 # ---------------------------------------------------------
 # Config
 # ---------------------------------------------------------
 
-# IMPORTANT: pour les tests, on désactive le secret interne
-INTERNAL_SECRET = ""  # <-- laisse vide tant que tu testes
+# Optionnel : si tu mets PYTHON_RECIPE_API_SECRET dans Render,
+# la fonction exigera le header x-internal-secret avec la même valeur.
+INTERNAL_SECRET = os.getenv("PYTHON_RECIPE_API_SECRET", "").strip()
 
-# Langues OCR : adapte si besoin ("fra", "eng", "fra+eng", ...)
+# Langues OCR utilisées par Tesseract
 TESS_LANG = os.getenv("TESS_LANG", "fra+eng")
 
 # ---------------------------------------------------------
-# App FastAPI
+# App
 # ---------------------------------------------------------
 
-app = FastAPI(title="Recipe OCR Service", version="1.0.0")
+app = FastAPI(title="Recipe OCR Service", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,7 +36,8 @@ app.add_middleware(
 
 
 class ImagePayload(BaseModel):
-    image_url: HttpUrl
+    # On accepte maintenant soit une URL http(s), soit une data URL base64
+    image_url: str
     household_id: Optional[str] = None
 
 
@@ -49,40 +52,18 @@ async def root():
 
 @app.post("/import-recipe-from-image")
 async def import_recipe_from_image(payload: ImagePayload, request: Request):
-    # Secret désactivé pour les tests
-    # if INTERNAL_SECRET:
-    #     header_secret = request.headers.get("x-internal-secret")
-    #     if header_secret != INTERNAL_SECRET:
-    #         raise HTTPException(status_code=401, detail="Unauthorized")
+    # Sécurité optionnelle
+    if INTERNAL_SECRET:
+        header_secret = request.headers.get("x-internal-secret")
+        if header_secret != INTERNAL_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
 
-    image_url = str(payload.image_url)
+    image_source = payload.image_url.strip()
 
-    # 1) Télécharger l'image
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            resp = await client.get(image_url)
-    except httpx.RequestError as e:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Erreur lors du téléchargement de l'image: {e}",
-        )
+    # 1) Récupérer l'image (data URL ou URL distante)
+    img = await load_image(image_source)
 
-    if resp.status_code != 200:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Impossible de télécharger l'image (status {resp.status_code})",
-        )
-
-    # 2) Charger l'image
-    try:
-        img = Image.open(BytesIO(resp.content))
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Le fichier téléchargé n'est pas une image valide.",
-        )
-
-    # 3) OCR Tesseract
+    # 2) OCR Tesseract
     try:
         text = pytesseract.image_to_string(img, lang=TESS_LANG)
     except pytesseract.TesseractError as e:
@@ -93,9 +74,12 @@ async def import_recipe_from_image(payload: ImagePayload, request: Request):
 
     text = (text or "").strip()
     if not text:
-        return {"ok": False, "error": "Aucun texte lisible détecté sur l'image."}
+        return {
+            "ok": False,
+            "error": "Aucun texte lisible détecté sur l'image.",
+        }
 
-    # 4) Parsing texte -> recette + ingrédients
+    # 3) Parsing texte -> recette + ingrédients
     recipe, ingredients = parse_recipe_from_text(text)
 
     if not ingredients:
@@ -104,11 +88,91 @@ async def import_recipe_from_image(payload: ImagePayload, request: Request):
             "error": "Texte détecté, mais aucun bloc d'ingrédients fiable n'a été trouvé.",
         }
 
-    return {"ok": True, "recipe": recipe, "ingredients": ingredients}
+    return {
+        "ok": True,
+        "recipe": recipe,
+        "ingredients": ingredients,
+    }
 
 
 # ---------------------------------------------------------
-# Parsing
+# Chargement image
+# ---------------------------------------------------------
+
+async def load_image(source: str) -> Image.Image:
+    """
+    - Si source commence par 'data:image', on décode le base64.
+    - Sinon, si c'est http/https, on télécharge.
+    - Sinon, erreur.
+    """
+    if source.startswith("data:image"):
+        # data URL: data:image/png;base64,xxxxx
+        try:
+            header, b64 = source.split(",", 1)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Data URL invalide.",
+            )
+        try:
+            binary = base64.b64decode(b64)
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Impossible de décoder l'image en base64.",
+            )
+        try:
+            img = Image.open(BytesIO(binary))
+            img.load()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Data URL ne contient pas une image valide.",
+            )
+        return img
+
+    # URL classique
+    if source.startswith("http://") or source.startswith("https://"):
+        try:
+            async with httpx.AsyncClient(
+                timeout=20.0, follow_redirects=True
+            ) as client:
+                resp = await client.get(source)
+        except httpx.RequestError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Erreur lors du téléchargement de l'image: {e}",
+            )
+
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Impossible de télécharger l'image "
+                    f"(status {resp.status_code})"
+                ),
+            )
+
+        try:
+            img = Image.open(BytesIO(resp.content))
+            img.load()
+        except Exception:
+            raise HTTPException(
+                status_code=400,
+                detail="Le fichier téléchargé n'est pas une image valide.",
+            )
+
+        return img
+
+    # Format non supporté
+    raise HTTPException(
+        status_code=400,
+        detail="Le champ 'image_url' doit être une URL http(s) ou une data URL base64.",
+    )
+
+
+# ---------------------------------------------------------
+# Parsing recette / ingrédients
 # ---------------------------------------------------------
 
 def parse_recipe_from_text(text: str):
@@ -147,9 +211,7 @@ def parse_recipe_from_text(text: str):
     else:
         ing_lines = lines[1:15]
 
-    ingredients = [
-        parse_ingredient_line(l) for l in ing_lines if len(l) > 2
-    ]
+    ingredients = [parse_ingredient_line(l) for l in ing_lines if len(l) > 2]
     ingredients = [i for i in ingredients if i["name"]]
 
     return recipe, ingredients
@@ -177,9 +239,17 @@ def parse_ingredient_line(line: str) -> dict:
 
     raw = line.strip()
     if not raw:
-        return {"raw": raw, "name": "", "quantity": None, "unit": None, "category": "principal"}
+        return {
+            "raw": raw,
+            "name": "",
+            "quantity": None,
+            "unit": None,
+            "category": "principal",
+        }
 
-    pattern = re.compile(r"^\s*(\d+(?:[.,]\d+)?)?\s*([A-Za-zÀ-ÿµ%\/\-\.]+)?\s*(.*)$")
+    pattern = re.compile(
+        r"^\s*(\d+(?:[.,]\d+)?)?\s*([A-Za-zÀ-ÿµ%/\-\.]+)?\s*(.*)$"
+    )
     m = pattern.match(raw)
 
     quantity = None
@@ -210,8 +280,14 @@ def parse_ingredient_line(line: str) -> dict:
             name = cleaned or name
 
     bad_starts = (
-        "préparation", "preparation", "étape", "etape",
-        "pour ", "cuire", "mélanger", "melanger",
+        "préparation",
+        "preparation",
+        "étape",
+        "etape",
+        "pour ",
+        "cuire",
+        "mélanger",
+        "melanger",
     )
     if name and name.lower().startswith(bad_starts):
         name = ""
