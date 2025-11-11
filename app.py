@@ -1,6 +1,6 @@
 import os
 from io import BytesIO
-from typing import Optional, List
+from typing import Optional
 
 import httpx
 import pytesseract
@@ -13,7 +13,8 @@ from pydantic import BaseModel, HttpUrl
 # Config
 # ---------------------------------------------------------
 
-INTERNAL_SECRET = os.getenv("PYTHON_RECIPE_API_SECRET", "").strip()
+# IMPORTANT: pour les tests, on désactive le secret interne
+INTERNAL_SECRET = ""  # <-- laisse vide tant que tu testes
 
 # Langues OCR : adapte si besoin ("fra", "eng", "fra+eng", ...)
 TESS_LANG = os.getenv("TESS_LANG", "fra+eng")
@@ -24,7 +25,6 @@ TESS_LANG = os.getenv("TESS_LANG", "fra+eng")
 
 app = FastAPI(title="Recipe OCR Service", version="1.0.0")
 
-# CORS large pour tests / usage via Supabase
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -49,12 +49,11 @@ async def root():
 
 @app.post("/import-recipe-from-image")
 async def import_recipe_from_image(payload: ImagePayload, request: Request):
-    # Sécurité optionnelle : si INTERNAL_SECRET est défini,
-    # on exige le header x-internal-secret identique.
-    if INTERNAL_SECRET:
-        header_secret = request.headers.get("x-internal-secret")
-        if header_secret != INTERNAL_SECRET:
-            raise HTTPException(status_code=401, detail="Unauthorized")
+    # Secret désactivé pour les tests
+    # if INTERNAL_SECRET:
+    #     header_secret = request.headers.get("x-internal-secret")
+    #     if header_secret != INTERNAL_SECRET:
+    #         raise HTTPException(status_code=401, detail="Unauthorized")
 
     image_url = str(payload.image_url)
 
@@ -83,7 +82,7 @@ async def import_recipe_from_image(payload: ImagePayload, request: Request):
             detail="Le fichier téléchargé n'est pas une image valide.",
         )
 
-    # 3) OCR Tesseract (gratuit)
+    # 3) OCR Tesseract
     try:
         text = pytesseract.image_to_string(img, lang=TESS_LANG)
     except pytesseract.TesseractError as e:
@@ -94,10 +93,7 @@ async def import_recipe_from_image(payload: ImagePayload, request: Request):
 
     text = (text or "").strip()
     if not text:
-        return {
-            "ok": False,
-            "error": "Aucun texte lisible détecté sur l'image.",
-        }
+        return {"ok": False, "error": "Aucun texte lisible détecté sur l'image."}
 
     # 4) Parsing texte -> recette + ingrédients
     recipe, ingredients = parse_recipe_from_text(text)
@@ -108,37 +104,22 @@ async def import_recipe_from_image(payload: ImagePayload, request: Request):
             "error": "Texte détecté, mais aucun bloc d'ingrédients fiable n'a été trouvé.",
         }
 
-    return {
-        "ok": True,
-        "recipe": recipe,
-        "ingredients": ingredients,
-    }
+    return {"ok": True, "recipe": recipe, "ingredients": ingredients}
 
 
 # ---------------------------------------------------------
-# Parsing recette / ingrédients depuis le texte OCR
+# Parsing
 # ---------------------------------------------------------
 
 def parse_recipe_from_text(text: str):
-    """
-    Heuristique simple mais robuste:
-    - 1ère ligne non vide = nom
-    - cherche une section "ingrédient(s)" pour isoler les lignes d'ingrédients
-    - sinon, prend quelques lignes après le titre
-    - renvoie un objet 'recipe' + une liste 'ingredients' compatibles
-      avec ton schéma Supabase existant.
-    """
-    lines = [l.strip() for l in text.splitlines()]
-    lines = [l for l in lines if l]
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     if not lines:
-        recipe = base_recipe("Recette importée")
-        return recipe, []
+        return base_recipe("Recette importée"), []
 
     name = lines[0]
     recipe = base_recipe(name)
 
-    # Chercher bloc ingrédients
     start_ing = None
     end_ing = None
 
@@ -149,7 +130,6 @@ def parse_recipe_from_text(text: str):
             break
 
     if start_ing is not None:
-        # Fin des ingrédients = avant "préparation", "etape", etc.
         for j in range(start_ing, len(lines)):
             low = lines[j].lower()
             if (
@@ -165,13 +145,11 @@ def parse_recipe_from_text(text: str):
             end_ing = len(lines)
         ing_lines = lines[start_ing:end_ing]
     else:
-        # Fallback : prend les 5-15 lignes après le titre comme "potentiels ingrédients"
         ing_lines = lines[1:15]
 
     ingredients = [
         parse_ingredient_line(l) for l in ing_lines if len(l) > 2
     ]
-    # Filtrer les lignes trop génériques / vides
     ingredients = [i for i in ingredients if i["name"]]
 
     return recipe, ingredients
@@ -195,21 +173,11 @@ def base_recipe(name: str) -> dict:
 
 
 def parse_ingredient_line(line: str) -> dict:
-    """
-    Approche proche de ta fonction TS :
-    '200 g de farine' -> quantity=200, unit='g', name='farine'
-    """
+    import re
+
     raw = line.strip()
     if not raw:
-        return {
-            "raw": raw,
-            "name": "",
-            "quantity": None,
-            "unit": None,
-            "category": "principal",
-        }
-
-    import re
+        return {"raw": raw, "name": "", "quantity": None, "unit": None, "category": "principal"}
 
     pattern = re.compile(r"^\s*(\d+(?:[.,]\d+)?)?\s*([A-Za-zÀ-ÿµ%\/\-\.]+)?\s*(.*)$")
     m = pattern.match(raw)
@@ -234,7 +202,6 @@ def parse_ingredient_line(line: str) -> dict:
         if m.group(2):
             unit = m.group(2).lower().rstrip(".")
         if m.group(3):
-            # nettoyer les "de", "d'", etc.
             cleaned = m.group(3).strip()
             for prefix in ("de ", "d'", "d’", "du ", "des "):
                 if cleaned.lower().startswith(prefix):
@@ -242,8 +209,10 @@ def parse_ingredient_line(line: str) -> dict:
                     break
             name = cleaned or name
 
-    # heuristique : si la ligne ressemble plus à un titre / étape, on l'ignore via name=""
-    bad_starts = ("préparation", "preparation", "étape", "etape", "pour ", "cuire", "mélanger")
+    bad_starts = (
+        "préparation", "preparation", "étape", "etape",
+        "pour ", "cuire", "mélanger", "melanger",
+    )
     if name and name.lower().startswith(bad_starts):
         name = ""
 
