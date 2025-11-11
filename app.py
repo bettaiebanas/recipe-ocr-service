@@ -14,24 +14,16 @@ from pydantic import BaseModel
 # Config
 # ---------------------------------------------------------
 
-# Optionnel : si tu mets PYTHON_RECIPE_API_SECRET dans Render,
-# la fonction exigera le header x-internal-secret avec la même valeur.
+# Secret interne optionnel :
+# - si PYTHON_RECIPE_API_SECRET est défini (non vide),
+#   on exige le header x-internal-secret avec la même valeur.
 INTERNAL_SECRET = os.getenv("PYTHON_RECIPE_API_SECRET", "").strip()
-
-@app.post("/import-recipe-from-image")
-async def import_recipe_from_image(payload: ImagePayload, request: Request):
-    # Sécurité optionnelle : n'active que si la variable est NON vide
-    if INTERNAL_SECRET:
-        header_secret = request.headers.get("x-internal-secret")
-        if header_secret != INTERNAL_SECRET:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-
 
 # Langues OCR utilisées par Tesseract
 TESS_LANG = os.getenv("TESS_LANG", "fra+eng")
 
 # ---------------------------------------------------------
-# App
+# App FastAPI
 # ---------------------------------------------------------
 
 app = FastAPI(title="Recipe OCR Service", version="1.1.0")
@@ -45,7 +37,9 @@ app.add_middleware(
 
 
 class ImagePayload(BaseModel):
-    # On accepte maintenant soit une URL http(s), soit une data URL base64
+    # On accepte :
+    # - URL http(s)
+    # - data URL base64 (data:image/png;base64,...)
     image_url: str
     household_id: Optional[str] = None
 
@@ -114,15 +108,12 @@ async def load_image(source: str) -> Image.Image:
     - Sinon, si c'est http/https, on télécharge.
     - Sinon, erreur.
     """
+    # Data URL base64
     if source.startswith("data:image"):
-        # data URL: data:image/png;base64,xxxxx
         try:
             header, b64 = source.split(",", 1)
         except ValueError:
-            raise HTTPException(
-                status_code=400,
-                detail="Data URL invalide.",
-            )
+            raise HTTPException(status_code=400, detail="Data URL invalide.")
         try:
             binary = base64.b64decode(b64)
         except Exception:
@@ -140,7 +131,7 @@ async def load_image(source: str) -> Image.Image:
             )
         return img
 
-    # URL classique
+    # URL http/https
     if source.startswith("http://") or source.startswith("https://"):
         try:
             async with httpx.AsyncClient(
@@ -173,7 +164,7 @@ async def load_image(source: str) -> Image.Image:
 
         return img
 
-    # Format non supporté
+    # Ni data URL ni http(s)
     raise HTTPException(
         status_code=400,
         detail="Le champ 'image_url' doit être une URL http(s) ou une data URL base64.",
@@ -185,6 +176,8 @@ async def load_image(source: str) -> Image.Image:
 # ---------------------------------------------------------
 
 def parse_recipe_from_text(text: str):
+    import re
+
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
     if not lines:
@@ -193,6 +186,7 @@ def parse_recipe_from_text(text: str):
     name = lines[0]
     recipe = base_recipe(name)
 
+    # Chercher section ingrédients
     start_ing = None
     end_ing = None
 
@@ -218,6 +212,7 @@ def parse_recipe_from_text(text: str):
             end_ing = len(lines)
         ing_lines = lines[start_ing:end_ing]
     else:
+        # fallback : lignes après le titre
         ing_lines = lines[1:15]
 
     ingredients = [parse_ingredient_line(l) for l in ing_lines if len(l) > 2]
