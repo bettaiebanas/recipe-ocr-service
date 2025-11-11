@@ -18,6 +18,15 @@ from pydantic import BaseModel
 # la fonction exigera le header x-internal-secret avec la même valeur.
 INTERNAL_SECRET = os.getenv("PYTHON_RECIPE_API_SECRET", "").strip()
 
+@app.post("/import-recipe-from-image")
+async def import_recipe_from_image(payload: ImagePayload, request: Request):
+    # Sécurité optionnelle : n'active que si la variable est NON vide
+    if INTERNAL_SECRET:
+        header_secret = request.headers.get("x-internal-secret")
+        if header_secret != INTERNAL_SECRET:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+
 # Langues OCR utilisées par Tesseract
 TESS_LANG = os.getenv("TESS_LANG", "fra+eng")
 
